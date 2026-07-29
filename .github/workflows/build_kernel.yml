@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - HEAD
+      - fix/actions-runner
   pull_request:
       branches:
       - HEAD
