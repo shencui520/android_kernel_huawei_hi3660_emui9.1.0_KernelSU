@@ -1,9 +1,6 @@
 name: Build Huawei-hi3660-KSU-EMUI9.1.0-Kernel
 on:
   workflow_dispatch:
-  schedule:
-      # Run once at 12:00 on Saturday. See http://crontab.guru
-      - cron: '00 12 * * 6'
   push:
     branches:
       - HEAD
