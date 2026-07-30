@@ -32,7 +32,7 @@ jobs:
         path: .cache/python2.7
         key: hi3660-python-2.7.18-ubuntu-22.04-v1
 
-    - name: Set up cross-branch ccache
+    - name: Set up kernel ccache
       uses: hendrikmuhs/ccache-action@v1.2
       with:
         key: hi3660-gcc49
