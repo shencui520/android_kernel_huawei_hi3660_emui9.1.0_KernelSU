@@ -25,6 +25,7 @@
 #include <linux/skbuff.h>
 #include <linux/workqueue.h>
 #include <net/addrconf.h>
+#include <net/net_namespace.h>
 #include <net/sock.h>
 #include <net/tcp.h>
 #include <net/udp.h>
@@ -671,6 +672,27 @@ done:
 	return iface_entry;
 }
 
+/* Find the active entry which owns this exact network device.
+ * Device names are not stable across network namespace moves, so teardown
+ * must never rely on the current name alone.
+ * Caller must hold iface_stat_list_lock.
+ */
+static struct iface_stat *get_iface_entry_by_dev(
+		const struct net_device *net_dev)
+{
+	struct iface_stat *iface_entry;
+
+	if (!net_dev)
+		return NULL;
+
+	list_for_each_entry(iface_entry, &iface_stat_list, list) {
+		if (iface_entry->active && iface_entry->net_dev == net_dev)
+			return iface_entry;
+	}
+
+	return NULL;
+}
+
 /* This is for fmt2 only */
 static void pp_iface_stat_header(struct seq_file *m)
 {
@@ -765,7 +787,7 @@ static int iface_stat_fmt_proc_show(struct seq_file *m, void *v)
 
 	iface_entry = list_entry(v, struct iface_stat, list);
 
-	if (iface_entry->active) {
+	if (iface_entry->active && iface_entry->net_dev) {
 		stats = dev_get_stats(iface_entry->net_dev,
 				      &dev_stats);
 	} else {
@@ -847,21 +869,36 @@ static void _iface_stat_set_active(struct iface_stat *entry,
 				   struct net_device *net_dev,
 				   bool activate)
 {
+	struct net_device *old_dev = entry->net_dev;
+
 	if (activate) {
+		if (entry->active && old_dev == net_dev)
+			return;
+
+		/* iface_stat entries live for the lifetime of qtaguid. Hold an
+		 * explicit reference while an entry is active so a transient
+		 * interface cannot be freed before proc readers finish with it.
+		 */
+		dev_hold(net_dev);
 		entry->net_dev = net_dev;
 		entry->active = true;
-		IF_DEBUG("qtaguid: %s(%s): "
-			 "enable tracking. rfcnt=%d\n", __func__,
-			 entry->ifname,
-			 __this_cpu_read(*net_dev->pcpu_refcnt));
+
+		if (old_dev)
+			dev_put(old_dev);
+
+		IF_DEBUG("qtaguid: %s(%s): enable tracking. netdev=%p\n",
+			 __func__,
+			 entry->ifname, net_dev);
 	} else {
 		entry->active = false;
 		entry->net_dev = NULL;
-		IF_DEBUG("qtaguid: %s(%s): "
-			 "disable tracking. rfcnt=%d\n", __func__,
-			 entry->ifname,
-			 __this_cpu_read(*net_dev->pcpu_refcnt));
 
+		if (old_dev)
+			dev_put(old_dev);
+
+		IF_DEBUG("qtaguid: %s(%s): disable tracking. netdev=%p\n",
+			 __func__,
+			 entry->ifname, old_dev);
 	}
 }
 
@@ -971,6 +1008,8 @@ static void iface_stat_create(struct net_device *net_dev,
 		pr_err("qtaguid: iface_stat: create(): no net dev\n");
 		return;
 	}
+	if (!net_eq(dev_net(net_dev), &init_net))
+		return;
 
 	ifname = net_dev->name;
 	if (!ifa) {
@@ -1036,6 +1075,8 @@ static void iface_stat_create_ipv6(struct net_device *net_dev,
 		pr_err("qtaguid: iface_stat: create6(): no net dev!\n");
 		return;
 	}
+	if (!net_eq(dev_net(net_dev), &init_net))
+		return;
 	ifname = net_dev->name;
 
 	in_dev = in_dev_get(net_dev);
@@ -1146,15 +1187,16 @@ static void iface_stat_update(struct net_device *net_dev, bool stash_only)
 	struct rtnl_link_stats64 dev_stats, *stats;
 	struct iface_stat *entry;
 
-	stats = dev_get_stats(net_dev, &dev_stats);
 	spin_lock_bh(&iface_stat_list_lock);
-	entry = get_iface_entry(net_dev->name);
+	entry = get_iface_entry_by_dev(net_dev);
 	if (entry == NULL) {
-		IF_DEBUG("qtaguid: iface_stat: update(%s): not tracked\n",
+		IF_DEBUG("qtaguid: update(%s): device not tracked\n",
 			 net_dev->name);
 		spin_unlock_bh(&iface_stat_list_lock);
 		return;
 	}
+
+	stats = dev_get_stats(net_dev, &dev_stats);
 
 	IF_DEBUG("qtaguid: %s(%s): entry=%p\n", __func__,
 		 net_dev->name, entry);
@@ -1465,6 +1507,8 @@ static int iface_netdev_event_handler(struct notifier_block *nb,
 
 	switch (event) {
 	case NETDEV_UP:
+		if (!net_eq(dev_net(dev), &init_net))
+			break;
 		iface_stat_create(dev, NULL);
 #ifdef CONFIG_HW_QTAGUID_PID
 		iface_pid_stat_create(dev, NULL);
@@ -1497,6 +1541,8 @@ static int iface_inet6addr_event_handler(struct notifier_block *nb,
 	case NETDEV_UP:
 		BUG_ON(!ifa || !ifa->idev);
 		dev = (struct net_device *)ifa->idev->dev;
+		if (!net_eq(dev_net(dev), &init_net))
+			break;
 		iface_stat_create_ipv6(dev, ifa);
 #ifdef CONFIG_HW_QTAGUID_PID
 		iface_pid_stat_create_ipv6(dev, ifa);
@@ -1531,6 +1577,8 @@ static int iface_inetaddr_event_handler(struct notifier_block *nb,
 	case NETDEV_UP:
 		BUG_ON(!ifa || !ifa->ifa_dev);
 		dev = ifa->ifa_dev->dev;
+		if (!net_eq(dev_net(dev), &init_net))
+			break;
 		iface_stat_create(dev, ifa);
 #ifdef CONFIG_HW_QTAGUID_PID
 		iface_pid_stat_create(dev, ifa);
