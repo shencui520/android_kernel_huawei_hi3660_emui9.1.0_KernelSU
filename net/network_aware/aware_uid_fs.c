@@ -306,6 +306,12 @@ static __net_init int aware_net_init(struct net *net)
     if (NULL == net){
         return 0;
     }
+	/* The policy and counters in this driver are global, not per-netns.
+	 * Publishing and reinitializing them for container namespaces corrupts
+	 * the Android host instance during namespace teardown.
+	 */
+	if (!net_eq(net, &init_net))
+		return 0;
 
     p_parent = proc_mkdir(AWARE_FS_NET_PATH, net->proc_net);
     if (NULL == p_parent){
@@ -320,10 +326,10 @@ static  void aware_net_exit(struct net *net)
     if (NULL == net){
         return ;
     }
-    remove_proc_entry(AWARE_FS_BG_UIDS, net->proc_net);
-    remove_proc_entry(AWARE_FS_FG_UIDS, net->proc_net);
-    remove_proc_entry(AWARE_FS_CTRL, net->proc_net);
-    remove_proc_entry(AWARE_FS_NET_PATH, net->proc_net);
+	if (!net_eq(net, &init_net))
+		return;
+
+	remove_proc_subtree(AWARE_FS_NET_PATH, net->proc_net);
 }
 
 static __net_initdata struct pernet_operations aware_net_ops = {
@@ -337,4 +343,3 @@ static int __init aware_proc_init(void)
 }
 
 fs_initcall(aware_proc_init);
-
