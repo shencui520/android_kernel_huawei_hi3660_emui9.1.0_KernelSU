@@ -1348,6 +1348,25 @@ static char *cgroup_file_name(struct cgroup *cgrp, const struct cftype *cft,
 	return buf;
 }
 
+#if defined(CONFIG_CPUSETS) && defined(CONFIG_CGROUP_CPUSET_PREFIX_COMPAT)
+static bool cgroup_file_needs_cpuset_prefix_alias(struct cgroup *cgrp,
+						   const struct cftype *cft)
+{
+	return cft->ss && cft->ss->id == cpuset_cgrp_id &&
+	       !(cft->flags & CFTYPE_NO_PREFIX) &&
+	       (cgrp->root->flags & (CGRP_ROOT_NOPREFIX |
+				      CGRP_ROOT_CPUSET_NOPREFIX));
+}
+
+static char *cgroup_cpuset_prefix_alias(const struct cftype *cft,
+					 char *buf)
+{
+	snprintf(buf, CGROUP_FILE_NAME_MAX, "%s.%s",
+		 cft->ss->legacy_name, cft->name);
+	return buf;
+}
+#endif
+
 /**
  * cgroup_file_mode - deduce file mode of a control file
  * @cft: the control file in question
@@ -1492,6 +1511,9 @@ static struct cgroup *cgroup_kn_lock_live(struct kernfs_node *kn,
 static void cgroup_rm_file(struct cgroup *cgrp, const struct cftype *cft)
 {
 	char name[CGROUP_FILE_NAME_MAX];
+#if defined(CONFIG_CPUSETS) && defined(CONFIG_CGROUP_CPUSET_PREFIX_COMPAT)
+	char alias_name[CGROUP_FILE_NAME_MAX];
+#endif
 
 	lockdep_assert_held(&cgroup_mutex);
 
@@ -1503,6 +1525,12 @@ static void cgroup_rm_file(struct cgroup *cgrp, const struct cftype *cft)
 		cfile->kn = NULL;
 		spin_unlock_irq(&cgroup_file_kn_lock);
 	}
+
+#if defined(CONFIG_CPUSETS) && defined(CONFIG_CGROUP_CPUSET_PREFIX_COMPAT)
+	if (cgroup_file_needs_cpuset_prefix_alias(cgrp, cft))
+		kernfs_remove_by_name(cgrp->kn,
+			cgroup_cpuset_prefix_alias(cft, alias_name));
+#endif
 
 	kernfs_remove_by_name(cgrp->kn, cgroup_file_name(cgrp, cft, name));
 }
@@ -3669,6 +3697,10 @@ static int cgroup_add_file(struct cgroup_subsys_state *css, struct cgroup *cgrp,
 	struct kernfs_node *kn;
 	struct lock_class_key *key = NULL;
 	int ret;
+#if defined(CONFIG_CPUSETS) && defined(CONFIG_CGROUP_CPUSET_PREFIX_COMPAT)
+	char alias_name[CGROUP_FILE_NAME_MAX];
+	struct kernfs_node *alias_kn;
+#endif
 
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 	key = &cft->lockdep_key;
@@ -3684,6 +3716,26 @@ static int cgroup_add_file(struct cgroup_subsys_state *css, struct cgroup *cgrp,
 		kernfs_remove(kn);
 		return ret;
 	}
+
+#if defined(CONFIG_CPUSETS) && defined(CONFIG_CGROUP_CPUSET_PREFIX_COMPAT)
+	if (cgroup_file_needs_cpuset_prefix_alias(cgrp, cft)) {
+		alias_kn = __kernfs_create_file(cgrp->kn,
+			cgroup_cpuset_prefix_alias(cft, alias_name),
+			cgroup_file_mode(cft), 0, cft->kf_ops, cft,
+			NULL, key);
+		if (IS_ERR(alias_kn)) {
+			pr_warn_ratelimited("cgroup: failed to create cpuset alias %s: %ld\n",
+					    alias_name, PTR_ERR(alias_kn));
+		} else {
+			ret = cgroup_kn_set_ugid(alias_kn);
+			if (ret) {
+				kernfs_remove(alias_kn);
+				pr_warn_ratelimited("cgroup: failed to set cpuset alias %s ownership: %d\n",
+						    alias_name, ret);
+			}
+		}
+	}
+#endif
 
 	if (cft->file_offset) {
 		struct cgroup_file *cfile = (void *)css + cft->file_offset;

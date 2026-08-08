@@ -1051,6 +1051,18 @@ config CPUSETS
 
 	  Say N if unsure.
 
+config CGROUP_CPUSET_PREFIX_COMPAT
+	bool "Expose standard cpuset file aliases on noprefix mounts"
+	depends on CPUSETS
+	default n
+	help
+	  Android commonly mounts the legacy cpuset hierarchy with the
+	  noprefix option, which exposes files such as "cpus" and "mems".
+	  Standard OCI runtimes expect the canonical "cpuset.cpus" and
+	  "cpuset.mems" names instead. Enable this option to expose both
+	  names for the same controls without changing Android's existing
+	  cpuset ABI.
+
 config PROC_PID_CPUSET
 	bool "Include legacy /proc/<pid>/cpuset file"
 	depends on CPUSETS
