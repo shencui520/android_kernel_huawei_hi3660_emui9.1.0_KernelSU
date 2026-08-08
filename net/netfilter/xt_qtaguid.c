@@ -662,14 +662,26 @@ static struct iface_stat *get_iface_entry(const char *ifname)
 		return NULL;
 	}
 
-	/* Iterate over interfaces */
+	/* An active device may be renamed after qtaguid created its entry.
+	 * Prefer the current netdevice name so packet accounting and later
+	 * address notifications keep using the same referenced device.
+	 */
 	list_for_each_entry(iface_entry, &iface_stat_list, list) {
-		if (!strcmp(ifname, iface_entry->ifname))
-			goto done;
+		if (iface_entry->active && iface_entry->net_dev &&
+		    !strcmp(ifname, iface_entry->net_dev->name))
+			return iface_entry;
 	}
-	iface_entry = NULL;
-done:
-	return iface_entry;
+
+	/* Inactive entries retain their historical name and counters so a
+	 * later device with the same name can resume accounting safely.
+	 */
+	list_for_each_entry(iface_entry, &iface_stat_list, list) {
+		if (!iface_entry->active &&
+		    !strcmp(ifname, iface_entry->ifname))
+			return iface_entry;
+	}
+
+	return NULL;
 }
 
 /* Find the active entry which owns this exact network device.
@@ -691,6 +703,15 @@ static struct iface_stat *get_iface_entry_by_dev(
 	}
 
 	return NULL;
+}
+
+/* Caller must hold iface_stat_list_lock while using the returned name. */
+static const char *iface_stat_current_name(const struct iface_stat *entry)
+{
+	if (entry->active && entry->net_dev)
+		return entry->net_dev->name;
+
+	return entry->ifname;
 }
 
 /* This is for fmt2 only */
@@ -717,7 +738,7 @@ static void pp_iface_stat_line(struct seq_file *m,
 	cnts = &iface_entry->totals_via_skb;
 	seq_printf(m, "%s %llu %llu %llu %llu %llu %llu %llu %llu "
 		   "%llu %llu %llu %llu %llu %llu %llu %llu\n",
-		   iface_entry->ifname,
+		   iface_stat_current_name(iface_entry),
 		   dc_sum_bytes(cnts, cnt_set, IFS_RX),
 		   dc_sum_packets(cnts, cnt_set, IFS_RX),
 		   dc_sum_bytes(cnts, cnt_set, IFS_TX),
@@ -799,7 +820,7 @@ static int iface_stat_fmt_proc_show(struct seq_file *m, void *v)
 	 */
 	if (p->fmt == 1) {
 		seq_printf(m, "%s %d %llu %llu %llu %llu %llu %llu %llu %llu\n",
-			   iface_entry->ifname,
+			   iface_stat_current_name(iface_entry),
 			   iface_entry->active,
 			   iface_entry->totals_via_dev[IFS_RX].bytes,
 			   iface_entry->totals_via_dev[IFS_RX].packets,
@@ -1507,6 +1528,7 @@ static int iface_netdev_event_handler(struct notifier_block *nb,
 
 	switch (event) {
 	case NETDEV_UP:
+	case NETDEV_CHANGENAME:
 		if (!net_eq(dev_net(dev), &init_net))
 			break;
 		iface_stat_create(dev, NULL);
