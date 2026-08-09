@@ -123,7 +123,7 @@ jobs:
         export ARCH=arm64
         export SUBARCH=arm64
         make $KERNEL_CMDLINE Pangu_KSU_defconfig
-        for option in SYSVIPC POSIX_MQUEUE FHANDLE NAMESPACES UTS_NS IPC_NS PID_NS NET_NS CGROUP_DEVICE HW_CGROUP_PIDS CGROUP_CPUSET_PREFIX_COMPAT MEMCG MEMCG_SWAP MEMCG_SWAP_ENABLED CFS_BANDWIDTH VETH NET_L3_MASTER_DEV MACVLAN IPVLAN NETFILTER_XT_MATCH_ADDRTYPE; do
+        for option in SYSVIPC POSIX_MQUEUE FHANDLE NAMESPACES UTS_NS IPC_NS PID_NS NET_NS CGROUP_DEVICE HW_CGROUP_PIDS CGROUP_CPUSET_PREFIX_COMPAT DOCKER_STAY_AWAKE MEMCG MEMCG_SWAP MEMCG_SWAP_ENABLED CFS_BANDWIDTH VETH NET_L3_MASTER_DEV MACVLAN IPVLAN NETFILTER_XT_MATCH_ADDRTYPE; do
           grep -q "^CONFIG_${option}=y$" out/.config || { echo "Missing CONFIG_${option}=y"; exit 1; }
         done
         # Huawei's HW_CGROUP_PIDS provides the pids controller used by Android
@@ -134,11 +134,11 @@ jobs:
         grep -q '^CONFIG_BRIDGE=y$' out/.config || { echo "Expected CONFIG_BRIDGE=y"; exit 1; }
         grep -q '^# CONFIG_BRIDGE_NETFILTER is not set$' out/.config || { echo "BRIDGE_NETFILTER must stay disabled"; exit 1; }
         make $KERNEL_CMDLINE CC="ccache aarch64-linux-gnu-gcc" HOSTCC="ccache gcc" -j$(nproc --all)
-        tools/mkbootimg --kernel out/arch/arm64/boot/Image.gz --base 0x0 --cmdline "loglevel=4 initcall_debug=n page_tracker=on slub_min_objects=16 unmovable_isolate1=2:192M,3:224M,4:256M printktimer=0xfff0a000,0x534,0x538 androidboot.selinux=enforcing buildvariant=user" --tags_offset 0x07A00000 --kernel_offset 0x00080000 --ramdisk_offset 0x07c00000 --header_version 1 --os_version 9 --os_patch_level 2020-09-05  --output Pangu_V9_KSU-DockerOciCompat-enforcing-${{ steps.get_time.outputs.TIME }}.img
-        tools/mkbootimg --kernel out/arch/arm64/boot/Image.gz --base 0x0 --cmdline "loglevel=4 initcall_debug=n page_tracker=on slub_min_objects=16 unmovable_isolate1=2:192M,3:224M,4:256M printktimer=0xfff0a000,0x534,0x538 androidboot.selinux=permissive buildvariant=user" --tags_offset 0x07A00000 --kernel_offset 0x00080000 --ramdisk_offset 0x07c00000 --header_version 1 --os_version 9 --os_patch_level 2020-09-05  --output Pangu_V9_KSU-DockerOciCompat-permissive-${{ steps.get_time.outputs.TIME }}.img
+        tools/mkbootimg --kernel out/arch/arm64/boot/Image.gz --base 0x0 --cmdline "loglevel=4 initcall_debug=n page_tracker=on slub_min_objects=16 unmovable_isolate1=2:192M,3:224M,4:256M printktimer=0xfff0a000,0x534,0x538 androidboot.selinux=enforcing buildvariant=user" --tags_offset 0x07A00000 --kernel_offset 0x00080000 --ramdisk_offset 0x07c00000 --header_version 1 --os_version 9 --os_patch_level 2020-09-05  --output Pangu_V9_KSU-DockerAwakeOciCompat-enforcing-${{ steps.get_time.outputs.TIME }}.img
+        tools/mkbootimg --kernel out/arch/arm64/boot/Image.gz --base 0x0 --cmdline "loglevel=4 initcall_debug=n page_tracker=on slub_min_objects=16 unmovable_isolate1=2:192M,3:224M,4:256M printktimer=0xfff0a000,0x534,0x538 androidboot.selinux=permissive buildvariant=user" --tags_offset 0x07A00000 --kernel_offset 0x00080000 --ramdisk_offset 0x07c00000 --header_version 1 --os_version 9 --os_patch_level 2020-09-05  --output Pangu_V9_KSU-DockerAwakeOciCompat-permissive-${{ steps.get_time.outputs.TIME }}.img
 
     - name: Upload V9-KSU-Kernel
       uses: actions/upload-artifact@v4
       with:
-        name: Pangu_V9_KSU-DockerOciCompat-kernel-${{ steps.get_time.outputs.TIME }}
+        name: Pangu_V9_KSU-DockerAwakeOciCompat-kernel-${{ steps.get_time.outputs.TIME }}
         path: "Pangu_V9_KSU-*.img"

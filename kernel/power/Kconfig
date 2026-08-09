@@ -142,6 +142,21 @@ config PM_WAKELOCKS_GC
 	depends on PM_WAKELOCKS
 	default y
 
+config DOCKER_STAY_AWAKE
+	bool "Keep the system awake for Docker workloads"
+	depends on PM_WAKELOCKS
+	default n
+	help
+	  Activate a permanent kernel wakeup source named
+	  "docker_stay_awake" during boot. The display may still turn off,
+	  but the system will not enter suspend-to-RAM, so container timers
+	  and cron jobs continue to run against wall-clock time.
+
+	  This increases screen-off power consumption. Root can release the
+	  wakeup source by writing "docker_stay_awake" to
+	  /sys/power/wake_unlock and acquire it again through
+	  /sys/power/wake_lock.
+
 config PM
 	bool "Device power management core functionality"
 	---help---
