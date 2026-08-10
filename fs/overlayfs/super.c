@@ -944,8 +944,9 @@ static int ovl_mount_dir(const char *name, struct path *path)
 		 * than rejecting the upperdir as if it were a remote filesystem.
 		 * Keep the historical rejection for every other filesystem.
 		 */
-		if (!err && ovl_dentry_remote(path->dentry) &&
-		    strcmp(path->mnt->mnt_sb->s_type->name, "f2fs")) {
+		if (!err && (path->dentry->d_flags & DCACHE_OP_REAL ||
+		    (ovl_dentry_remote(path->dentry) &&
+		     strcmp(path->mnt->mnt_sb->s_type->name, "f2fs")))) {
 			pr_err("overlayfs: filesystem on '%s' not supported as upperdir\n",
 			       tmp);
 			path_put(path);
