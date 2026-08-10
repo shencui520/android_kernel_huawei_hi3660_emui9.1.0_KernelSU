@@ -422,6 +422,15 @@ static bool ovl_dentry_remote(struct dentry *dentry)
 		 DCACHE_OP_REAL);
 }
 
+static bool ovl_dentry_upper_supported(struct dentry *dentry)
+{
+	if (dentry->d_flags & DCACHE_OP_REAL)
+		return false;
+
+	return !ovl_dentry_remote(dentry) ||
+	       !strcmp(dentry->d_sb->s_type->name, "f2fs");
+}
+
 static bool ovl_dentry_weird(struct dentry *dentry)
 {
 	return dentry->d_flags & (DCACHE_NEED_AUTOMOUNT |
@@ -496,7 +505,7 @@ struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
 			goto out;
 
 		if (this) {
-			if (unlikely(ovl_dentry_remote(this))) {
+			if (unlikely(!ovl_dentry_upper_supported(this))) {
 				dput(this);
 				err = -EREMOTE;
 				goto out;
@@ -944,9 +953,7 @@ static int ovl_mount_dir(const char *name, struct path *path)
 		 * than rejecting the upperdir as if it were a remote filesystem.
 		 * Keep the historical rejection for every other filesystem.
 		 */
-		if (!err && (path->dentry->d_flags & DCACHE_OP_REAL ||
-		    (ovl_dentry_remote(path->dentry) &&
-		     strcmp(path->mnt->mnt_sb->s_type->name, "f2fs")))) {
+		if (!err && !ovl_dentry_upper_supported(path->dentry)) {
 			pr_err("overlayfs: filesystem on '%s' not supported as upperdir\n",
 			       tmp);
 			path_put(path);
