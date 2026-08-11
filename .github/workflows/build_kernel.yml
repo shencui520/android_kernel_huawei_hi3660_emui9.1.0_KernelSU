@@ -1,9 +1,6 @@
 name: Build Huawei-hi3660-KSU-EMUI9.1.0-Kernel
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - docker-oci-screen-off-awake
 
 jobs:
   build:
