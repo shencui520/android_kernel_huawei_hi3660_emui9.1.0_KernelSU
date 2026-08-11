@@ -2800,6 +2800,12 @@ static ssize_t proc_pid_attr_write(struct file * file, const char __user * buf,
 	length = -ESRCH;
 	if (!task)
 		goto out_no_task;
+
+	/* Prevent changes to overridden credentials. */
+	length = -EBUSY;
+	if (current_cred() != current_real_cred())
+		goto out;
+
 	if (count > PAGE_SIZE)
 		count = PAGE_SIZE;
 
