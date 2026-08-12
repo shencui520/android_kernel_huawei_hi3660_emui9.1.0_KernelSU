@@ -6,6 +6,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     env:
+      TZ: Asia/Shanghai
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
       CCACHE_MAXSIZE: "2G"
@@ -72,10 +73,13 @@ jobs:
         export PATH="$python2_prefix/bin:$PATH"
         python --version
     
-    - name: GetTime
+    - name: Set Beijing build time
       id: get_time
       run: |
-        echo "TIME=$(TZ=UTC-8 date +%m%d%H%M )" >> $GITHUB_OUTPUT
+        test "$(date +%z)" = "+0800" || { echo "Expected Asia/Shanghai timezone"; exit 1; }
+        echo "TIME=$(date +%m%d%H%M)" >> "$GITHUB_OUTPUT"
+        echo "BUILD_TIMESTAMP=$(date '+%a %b %d %T %Z %Y')" >> "$GITHUB_OUTPUT"
+        echo "Artifact time: $(date '+%Y-%m-%d %H:%M:%S %Z (%z)')"
 
     # - name: Build Kernel
     #   run: |
@@ -105,7 +109,10 @@ jobs:
     #     path: "Pangu_P10_KSU-*.img"
 
     - name: Build V9-KSU-Kernel
+      env:
+        KBUILD_BUILD_TIMESTAMP: ${{ steps.get_time.outputs.BUILD_TIMESTAMP }}
       run: |
+        echo "Kernel build timestamp: $KBUILD_BUILD_TIMESTAMP"
         if [ -d include/config ];
          then
           echo "Find config,will remove it"
@@ -135,6 +142,7 @@ jobs:
         grep -q '^# CONFIG_BRIDGE_NETFILTER is not set$' out/.config || { echo "BRIDGE_NETFILTER must stay disabled"; exit 1; }
         ! grep -q '^CONFIG_DOCKER_STAY_AWAKE=y$' out/.config || { echo "Permanent Docker wake lock must stay disabled"; exit 1; }
         make $KERNEL_CMDLINE CC="ccache aarch64-linux-gnu-gcc" HOSTCC="ccache gcc" -j$(nproc --all)
+        grep -F "$KBUILD_BUILD_TIMESTAMP" out/include/generated/compile.h || { echo "Kernel timestamp was not embedded"; exit 1; }
         tools/mkbootimg --kernel out/arch/arm64/boot/Image.gz --base 0x0 --cmdline "loglevel=4 initcall_debug=n page_tracker=on slub_min_objects=16 unmovable_isolate1=2:192M,3:224M,4:256M printktimer=0xfff0a000,0x534,0x538 androidboot.selinux=enforcing buildvariant=user" --tags_offset 0x07A00000 --kernel_offset 0x00080000 --ramdisk_offset 0x07c00000 --header_version 1 --os_version 9 --os_patch_level 2020-09-05  --output Pangu_V9_KSU-LinuxServer-enforcing-${{ steps.get_time.outputs.TIME }}.img
         tools/mkbootimg --kernel out/arch/arm64/boot/Image.gz --base 0x0 --cmdline "loglevel=4 initcall_debug=n page_tracker=on slub_min_objects=16 unmovable_isolate1=2:192M,3:224M,4:256M printktimer=0xfff0a000,0x534,0x538 androidboot.selinux=permissive buildvariant=user" --tags_offset 0x07A00000 --kernel_offset 0x00080000 --ramdisk_offset 0x07c00000 --header_version 1 --os_version 9 --os_patch_level 2020-09-05  --output Pangu_V9_KSU-LinuxServer-permissive-${{ steps.get_time.outputs.TIME }}.img
 
