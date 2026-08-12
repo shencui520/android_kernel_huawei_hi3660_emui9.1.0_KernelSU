@@ -96,9 +96,6 @@
 #if ((defined(CONFIG_HW_VIP_THREAD)) || (defined(CONFIG_HW_QOS_THREAD)))
 #include <cpu_netlink/cpu_netlink.h>
 #endif
-#ifdef CONFIG_HW_CGROUP_PIDS
-#include "cgroup_huawei/cgroup_pids.h"
-#endif
 #include <linux/cpufreq_times.h>
 #ifdef CONFIG_HWAA
 #include <huawei_platform/hwaa/hwaa_proc_hooks.h>
@@ -1634,19 +1631,9 @@ static __latent_entropy struct task_struct *copy_process(
 			goto bad_fork_free;
 	}
 	current->flags &= ~PF_NPROC_EXCEEDED;
-#ifdef CONFIG_HW_CGROUP_PIDS
-        retval = cgroup_pids_can_fork();
-        if (retval < 0)
-                goto bad_fork_free;
-
-        retval = copy_creds(p, clone_flags);
-        if (retval < 0)
-                goto bad_fork_cleanup_cgroup_pids;
-#else
-        retval = copy_creds(p, clone_flags);
-        if (retval < 0)
-                goto bad_fork_free;
-#endif
+	retval = copy_creds(p, clone_flags);
+	if (retval < 0)
+		goto bad_fork_free;
 	/*
 	 * If multiple threads are within copy_process(), then this check
 	 * triggers too late. This doesn't hurt, the check is only there
@@ -2014,10 +2001,6 @@ bad_fork_cleanup_threadgroup_lock:
 bad_fork_cleanup_count:
 	atomic_dec(&p->cred->user->processes);
 	exit_creds(p);
-#ifdef CONFIG_HW_CGROUP_PIDS
-bad_fork_cleanup_cgroup_pids:
-        cgroup_pids_cancel_fork();
-#endif
 bad_fork_free:
 	p->state = TASK_DEAD;
 	put_task_stack(p);

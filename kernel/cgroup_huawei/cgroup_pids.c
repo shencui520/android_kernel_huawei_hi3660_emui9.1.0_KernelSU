@@ -386,14 +386,15 @@ static void pids_attach(struct cgroup_taskset *tset)
 	tmp_gp = NULL;
 }
 
-int cgroup_pids_can_fork(void)
+/* Called with threadgroup_change_begin() held by copy_process(). */
+static int pids_can_fork(struct task_struct *task)
 {
-	struct pids_cgroup *pids = NULL;
+	struct cgroup_subsys_state *css;
+	struct pids_cgroup *pids;
 	int ret;
 
-	rcu_read_lock();
-	pids = task_pids(current);
-	rcu_read_unlock();
+	css = task_css_check(current, pids_cgrp_id, true);
+	pids = css_pids(css);
 	ret = pids_try_charge(pids, 1);
 	if (ret)
 		return ret;
@@ -410,17 +411,15 @@ int cgroup_pids_can_fork(void)
 	}
 	spin_unlock(&group_pids_lock);
 	return ret;
-
 }
 
-void cgroup_pids_cancel_fork(void)
+static void pids_cancel_fork(struct task_struct *task)
 {
+	struct cgroup_subsys_state *css;
+	struct pids_cgroup *pids;
 
-	struct pids_cgroup *pids = NULL;
-
-	rcu_read_lock();
-	pids = task_pids(current);
-	rcu_read_unlock();
+	css = task_css_check(current, pids_cgrp_id, true);
+	pids = css_pids(css);
 	pids_uncharge(pids, 1);
 
 	spin_lock(&group_pids_lock);
@@ -904,6 +903,8 @@ struct cgroup_subsys pids_cgrp_subsys = {
 	.can_attach = pids_can_attach,
 	.cancel_attach = pids_cancel_attach,
 	.attach = pids_attach,
+	.can_fork = pids_can_fork,
+	.cancel_fork = pids_cancel_fork,
 	.fork = pids_fork,
 	.exit = pids_exit,
 	.legacy_cftypes = files,
