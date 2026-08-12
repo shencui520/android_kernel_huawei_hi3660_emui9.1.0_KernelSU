@@ -1,6 +1,0 @@
-id=hi3660_linux_server
-name=Hi3660 Linux Server Runtime
-version=0.1.0
-versionCode=1
-author=shencui520 contributors
-description=Dynamic wake lock, ext4 loop storage, cgroup v1, Docker overlay2 and Debian/Ubuntu system-container management for EMUI 9.1.
