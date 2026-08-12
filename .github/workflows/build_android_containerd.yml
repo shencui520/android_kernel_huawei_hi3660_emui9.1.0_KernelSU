@@ -1,0 +1,67 @@
+name: Build Android containerd runtime
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    env:
+      CONTAINERD_REF: v1.7.3
+      RUNTIME_VERSION: v1.7.3-android-cgroupstats
+    steps:
+      - name: Checkout runtime patches
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.20.14'
+          cache: false
+
+      - name: Fetch pinned containerd source
+        run: |
+          git clone --branch "$CONTAINERD_REF" --depth 1 https://github.com/containerd/containerd.git containerd-src
+          git -C containerd-src rev-parse HEAD | tee containerd-source-commit.txt
+
+      - name: Apply Android cgroup compatibility patch
+        run: |
+          git -C containerd-src apply --check "$GITHUB_WORKSPACE/runtime-patches/containerd-1.7.3-android-cgroup-root.diff"
+          git -C containerd-src apply "$GITHUB_WORKSPACE/runtime-patches/containerd-1.7.3-android-cgroup-root.diff"
+          grep -F 'candidate == "/sys/fs/cgroup"' containerd-src/vendor/github.com/containerd/cgroups/v3/cgroup1/v1.go
+
+      - name: Build static ARM64 runtime
+        working-directory: containerd-src
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: arm64
+        run: |
+          make STATIC=1 VERSION="$RUNTIME_VERSION" bin/containerd bin/containerd-shim-runc-v2
+          file bin/containerd bin/containerd-shim-runc-v2
+          file bin/containerd bin/containerd-shim-runc-v2 | grep -c 'ARM aarch64' | grep -q '^2$'
+          file bin/containerd bin/containerd-shim-runc-v2 | grep -c 'statically linked' | grep -q '^2$'
+
+      - name: Assemble and verify artifact
+        run: |
+          mkdir -p artifact
+          install -m 0755 containerd-src/bin/containerd artifact/containerd.real
+          install -m 0755 containerd-src/bin/containerd-shim-runc-v2 artifact/containerd-shim-runc-v2
+          cp containerd-source-commit.txt artifact/source-commit.txt
+          sha256sum runtime-patches/containerd-1.7.3-android-cgroup-root.diff > artifact/patch.sha256
+          (cd artifact && sha256sum containerd.real containerd-shim-runc-v2 > checksums.sha256)
+          printf '%s\n' "$RUNTIME_VERSION" > artifact/runtime-version.txt
+          test "$(stat -c '%a' artifact/containerd.real)" = 755
+          test "$(stat -c '%a' artifact/containerd-shim-runc-v2)" = 755
+
+      - name: Upload Android runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: containerd-1.7.3-android-cgroupstats-arm64
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 14

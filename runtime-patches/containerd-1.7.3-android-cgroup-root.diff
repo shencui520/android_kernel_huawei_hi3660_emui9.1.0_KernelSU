@@ -1,0 +1,39 @@
+diff --git a/vendor/github.com/containerd/cgroups/v3/cgroup1/v1.go b/vendor/github.com/containerd/cgroups/v3/cgroup1/v1.go
+index ce025bb..6d11a3d 100644
+--- a/vendor/github.com/containerd/cgroups/v3/cgroup1/v1.go
++++ b/vendor/github.com/containerd/cgroups/v3/cgroup1/v1.go
+@@ -53,6 +53,7 @@ func v1MountPoint() (string, error) {
+ 	}
+ 	defer f.Close()
+ 	scanner := bufio.NewScanner(f)
++	var fallback string
+ 	for scanner.Scan() {
+ 		var (
+ 			text      = scanner.Text()
+@@ -63,11 +64,25 @@ func v1MountPoint() (string, error) {
+ 			return "", fmt.Errorf("mountinfo: bad entry %q", text)
+ 		}
+ 		if fields[numFields-3] == "cgroup" {
+-			return filepath.Dir(fields[4]), nil
++			candidate := filepath.Dir(fields[4])
++			if fallback == "" {
++				fallback = candidate
++			}
++			// Android mounts legacy controller aliases such as /acct and
++			// /dev/memcg before the Docker-compatible split hierarchy under
++			// /sys/fs/cgroup. Returning the first parent (normally "/") makes
++			// every subsystem look deleted and the runc v2 shim cannot return
++			// task metrics. Prefer the conventional hierarchy when present.
++			if candidate == "/sys/fs/cgroup" {
++				return candidate, nil
++			}
+ 		}
+ 	}
+ 	if err := scanner.Err(); err != nil {
+ 		return "", err
+ 	}
++	if fallback != "" {
++		return fallback, nil
++	}
+ 	return "", ErrMountPointNotExist
+ }
