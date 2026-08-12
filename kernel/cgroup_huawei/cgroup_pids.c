@@ -309,15 +309,14 @@ revert:
 
 /* This is protected by cgroup lock */
 static struct group_pids *tmp_gp;
-static struct pids_cgroup *pids_attach_old_cs;
 
 static int pids_can_attach(struct cgroup_taskset *tset)
 {
+	struct task_struct *task;
 	struct cgroup_subsys_state *css;
 	struct pids_cgroup *pids;
 
-	/* used later by pids_attach() */
-	pids_attach_old_cs = task_pids(cgroup_taskset_first(tset, &css));
+	cgroup_taskset_first(tset, &css);
 	pids = css_pids(css);
 
 	WARN_ON(tmp_gp);
@@ -332,11 +331,36 @@ static int pids_can_attach(struct cgroup_taskset *tset)
 	tmp_gp->soft_limit = pids->group_soft_limit;
 	tmp_gp->limit = pids->group_limit;
 
+	/*
+	 * A taskset may contain tasks from more than one source cgroup.  Move
+	 * the hierarchical charge per task while task_css() still points at
+	 * the source css.  The cgroup core keeps both csses alive until the
+	 * migration either commits or is cancelled.
+	 */
+	cgroup_taskset_for_each(task, css, tset) {
+		struct pids_cgroup *old_pids = task_pids(task);
+
+		pids = css_pids(css);
+		pids_charge(pids, 1);
+		pids_uncharge(old_pids, 1);
+	}
+
 	return 0;
 }
 
 static void pids_cancel_attach(struct cgroup_taskset *tset)
 {
+	struct task_struct *task;
+	struct cgroup_subsys_state *css;
+
+	cgroup_taskset_for_each(task, css, tset) {
+		struct pids_cgroup *old_pids = task_pids(task);
+		struct pids_cgroup *pids = css_pids(css);
+
+		pids_charge(old_pids, 1);
+		pids_uncharge(pids, 1);
+	}
+
 	kfree(tmp_gp);
 	tmp_gp = NULL;
 }
@@ -346,29 +370,18 @@ static void pids_attach(struct cgroup_taskset *tset)
 	struct cgroup_subsys_state *css;
 	struct pids_cgroup *pids;
 	struct task_struct *task;
-	int64_t num = 0;
 
-	cgroup_taskset_first(tset,&css);
+	cgroup_taskset_first(tset, &css);
 	pids = css_pids(css);
 
 	spin_lock(&group_pids_lock);
 
-	cgroup_taskset_for_each(task,css,tset) {
-		num++;
-		pids_uncharge(pids_attach_old_cs, 1);
-
+	cgroup_taskset_for_each(task, css, tset) {
 		group_pids_migrate(task, tmp_gp);
 	}
 	list_add(&tmp_gp->node, &pids->group_pids_list);
 
 	spin_unlock(&group_pids_lock);
-
-	/*
-	 * Attaching to a cgroup is allowed to overcome the
-	 * the PID limit, so that organisation operations aren't
-	 * blocked by the `pids` cgroup controller.
-	 */
-	pids_charge(pids, num);
 
 	tmp_gp = NULL;
 }
