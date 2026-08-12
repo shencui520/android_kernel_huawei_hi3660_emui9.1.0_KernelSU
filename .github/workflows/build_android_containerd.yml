@@ -16,7 +16,7 @@ jobs:
       contents: read
     env:
       CONTAINERD_REF: v1.7.3
-      RUNTIME_VERSION: v1.7.3-android-cgroupstats
+      RUNTIME_VERSION: v1.7.3-android-cgroupstats2
     steps:
       - name: Checkout runtime patches
         uses: actions/checkout@v4
@@ -40,6 +40,7 @@ jobs:
           git -C containerd-src apply --check "$GITHUB_WORKSPACE/runtime-patches/containerd-1.7.3-android-cgroup-root.diff"
           git -C containerd-src apply "$GITHUB_WORKSPACE/runtime-patches/containerd-1.7.3-android-cgroup-root.diff"
           grep -F 'candidate == "/sys/fs/cgroup"' containerd-src/vendor/github.com/containerd/cgroups/v3/cgroup1/v1.go
+          grep -F 'DefaultStateDir = "/dev/kdp/cd/tmp"' containerd-src/defaults/defaults_unix.go
 
       - name: Build static ARM64 runtime
         working-directory: containerd-src
@@ -68,7 +69,7 @@ jobs:
       - name: Upload Android runtime
         uses: actions/upload-artifact@v4
         with:
-          name: containerd-1.7.3-android-cgroupstats-arm64
+          name: containerd-1.7.3-android-cgroupstats2-arm64
           path: artifact/
           if-no-files-found: error
           retention-days: 14

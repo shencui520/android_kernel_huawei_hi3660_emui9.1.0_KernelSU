@@ -37,3 +37,17 @@ index ce025bb..6d11a3d 100644
 +	}
  	return "", ErrMountPointNotExist
  }
+diff --git a/defaults/defaults_unix.go b/defaults/defaults_unix.go
+--- a/defaults/defaults_unix.go
++++ b/defaults/defaults_unix.go
+@@ -24,7 +24,9 @@ const (
+ 	DefaultRootDir = "/var/lib/containerd"
+ 	// DefaultStateDir is the default location used by containerd to store
+ 	// transient data
+-	DefaultStateDir = "/run/containerd"
++	// Android mounts /run read-only. The module prepares this tmpfs-backed
++	// directory before dockerd starts, including the runc v2 shim socket root.
++	DefaultStateDir = "/dev/kdp/cd/tmp"
+ 	// DefaultAddress is the default unix socket address
+ 	DefaultAddress = "/run/containerd/containerd.sock"
+ 	// DefaultDebugAddress is the default unix socket address for pprof data
