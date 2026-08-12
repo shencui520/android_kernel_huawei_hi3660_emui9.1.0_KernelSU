@@ -667,14 +667,6 @@ static int __init pm_init(void)
 	error = sysfs_create_group(power_kobj, &attr_group);
 	if (error)
 		return error;
-#ifdef CONFIG_DOCKER_STAY_AWAKE
-	error = pm_wake_lock("docker_stay_awake");
-	if (error)
-		pr_warn("PM: failed to activate Docker stay-awake source: %d\n",
-			error);
-	else
-		pr_info("PM: Docker stay-awake source active\n");
-#endif
 	pm_print_times_init();
 	return pm_autosleep_init();
 }

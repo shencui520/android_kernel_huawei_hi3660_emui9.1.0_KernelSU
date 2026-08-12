@@ -1,0 +1,684 @@
+#!/system/bin/sh
+
+umask 077
+
+MODDIR=${0%/bin/serverctl}
+DEFAULT_STATE_DIR=/data/adb/hi3660-server
+STATE_DIR=$DEFAULT_STATE_DIR
+SERVER_MOUNT=/data/local/linux-server
+STORAGE_SIZE_MB=8192
+PREALLOCATE_STORAGE=1
+FSCK_ON_MOUNT=1
+AUTO_MOUNT_STORAGE=1
+AUTO_START_DOCKER=1
+AUTO_RESTART_DOCKER=1
+AUTO_START_LINUX=0
+AUTO_RESTART_LINUX=0
+DOCKERD_BIN=auto
+DOCKER_BIN=auto
+RUNC_BIN=auto
+UNSHARE_BIN=auto
+NSENTER_BIN=auto
+LINUX_HOSTNAME=hi3660-linux
+MONITOR_INTERVAL=30
+
+CONFIG_FILE="$DEFAULT_STATE_DIR/server.conf"
+if [ -r "$CONFIG_FILE" ]; then
+    # This file is root-owned and mode 0600; it intentionally uses shell
+    # assignments so advanced users can relocate the data image.
+    . "$CONFIG_FILE"
+fi
+
+CONFIG_FILE="$STATE_DIR/server.conf"
+IMAGE_FILE="$STATE_DIR/server-data.ext4"
+RUN_DIR="$STATE_DIR/run"
+LOG_DIR="$STATE_DIR/log"
+DOCKER_DATA="$SERVER_MOUNT/docker"
+ROOTFS="$SERVER_MOUNT/rootfs"
+CGROUP_ROOT="$RUN_DIR/cgroup"
+DOCKER_PIDFILE="$RUN_DIR/dockerd.pid"
+LINUX_PIDFILE="$RUN_DIR/linux-init.pid"
+MONITOR_PIDFILE="$RUN_DIR/monitor.pid"
+DOCKER_STOP_FILE="$RUN_DIR/docker.manual-stop"
+LINUX_STOP_FILE="$RUN_DIR/linux.manual-stop"
+LOOP_FILE="$RUN_DIR/storage.loop"
+DOCKER_CONFIG="$STATE_DIR/docker-daemon.json"
+WAKELOCK_NAME=hi3660_linux_server
+
+PATH=/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr/sbin:/data/adb/ksu/bin:/system/bin:/system/xbin:/vendor/bin:/sbin:$PATH
+export PATH
+
+log()
+{
+    echo "serverctl: $*"
+}
+
+die()
+{
+    log "ERROR: $*" >&2
+    exit 1
+}
+
+ensure_dirs()
+{
+    mkdir -p "$STATE_DIR" "$RUN_DIR" "$LOG_DIR"
+    chmod 700 "$STATE_DIR" "$RUN_DIR" "$LOG_DIR" 2>/dev/null || true
+}
+
+find_cmd()
+{
+    requested=$1
+    shift
+    if [ -n "$requested" ] && [ "$requested" != auto ] && [ -x "$requested" ]; then
+        echo "$requested"
+        return 0
+    fi
+    for candidate in "$@"; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            command -v "$candidate"
+            return 0
+        fi
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+pid_is_running()
+{
+    pidfile=$1
+    [ -r "$pidfile" ] || return 1
+    pid=$(cat "$pidfile" 2>/dev/null)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+is_mounted()
+{
+    target=$1
+    awk -v target="$target" '$2 == target { found=1 } END { exit !found }' /proc/mounts
+}
+
+storage_is_mounted()
+{
+    is_mounted "$SERVER_MOUNT"
+}
+
+acquire_wakelock()
+{
+    if [ -w /sys/power/wake_lock ]; then
+        echo "$WAKELOCK_NAME" > /sys/power/wake_lock 2>/dev/null || true
+    fi
+}
+
+refresh_wakelock()
+{
+    if pid_is_running "$DOCKER_PIDFILE" || pid_is_running "$LINUX_PIDFILE"; then
+        acquire_wakelock
+    elif [ -w /sys/power/wake_unlock ]; then
+        echo "$WAKELOCK_NAME" > /sys/power/wake_unlock 2>/dev/null || true
+    fi
+}
+
+wait_for_android()
+{
+    n=0
+    while [ "$(getprop sys.boot_completed 2>/dev/null)" != 1 ] && [ "$n" -lt 120 ]; do
+        sleep 2
+        n=$((n + 1))
+    done
+}
+
+init_storage()
+{
+    ensure_dirs
+    size=${1:-$STORAGE_SIZE_MB}
+    case "$size" in
+        ''|*[!0-9]*) die "storage size must be an integer number of MiB" ;;
+    esac
+    [ "$size" -ge 1024 ] || die "storage size must be at least 1024 MiB"
+    [ ! -e "$IMAGE_FILE" ] || die "$IMAGE_FILE already exists"
+
+    if [ "$PREALLOCATE_STORAGE" = 1 ]; then
+        alloc=$(find_cmd auto fallocate) || die "fallocate not found; install Termux util-linux or set PREALLOCATE_STORAGE=0"
+        log "preallocating ${size} MiB at $IMAGE_FILE"
+        "$alloc" -l "${size}M" "$IMAGE_FILE" || die "could not allocate storage image"
+    else
+        dd_bin=$(find_cmd auto dd) || die "dd not found"
+        log "creating sparse ${size} MiB image at $IMAGE_FILE"
+        "$dd_bin" if=/dev/zero of="$IMAGE_FILE" bs=1M count=0 seek="$size" || die "could not create sparse image"
+    fi
+    chmod 600 "$IMAGE_FILE"
+
+    mkfs=$(find_cmd auto mke2fs /data/data/com.termux/files/usr/bin/mke2fs) || die "mke2fs not found; run: pkg install e2fsprogs"
+    log "formatting ext4 without post-4.9-only metadata features"
+    if ! "$mkfs" -t ext4 -F -m 0 -O '^64bit,^metadata_csum,^orphan_file' -E lazy_itable_init=0,lazy_journal_init=0 "$IMAGE_FILE"; then
+        log "mke2fs does not know orphan_file; retrying with legacy feature list"
+        "$mkfs" -t ext4 -F -m 0 -O '^64bit,^metadata_csum' -E lazy_itable_init=0,lazy_journal_init=0 "$IMAGE_FILE" || die "ext4 formatting failed"
+    fi
+    log "storage image created; run: serverctl mount-storage"
+}
+
+mount_storage()
+{
+    ensure_dirs
+    storage_is_mounted && return 0
+    [ -f "$IMAGE_FILE" ] || die "$IMAGE_FILE is missing; run: serverctl init-storage [MiB]"
+
+    losetup_bin=$(find_cmd auto losetup /data/data/com.termux/files/usr/bin/losetup) || die "losetup not found; run: pkg install util-linux"
+    mkdir -p "$SERVER_MOUNT"
+    loopdev=$("$losetup_bin" -j "$IMAGE_FILE" 2>/dev/null | sed -n '1s/:.*//p')
+    if [ -z "$loopdev" ]; then
+        loopdev=$("$losetup_bin" -f 2>/dev/null) || die "no free loop device"
+        "$losetup_bin" "$loopdev" "$IMAGE_FILE" || die "could not attach $IMAGE_FILE"
+    fi
+    echo "$loopdev" > "$LOOP_FILE"
+
+    if [ "$FSCK_ON_MOUNT" = 1 ]; then
+        fsck=$(find_cmd auto e2fsck /data/data/com.termux/files/usr/bin/e2fsck) || die "e2fsck not found; run: pkg install e2fsprogs"
+        "$fsck" -p "$loopdev"
+        result=$?
+        [ "$result" -le 1 ] || die "e2fsck failed with status $result"
+    fi
+
+    mount -t ext4 -o rw,noatime,nodiratime,nosuid,nodev "$loopdev" "$SERVER_MOUNT" || {
+        "$losetup_bin" -d "$loopdev" 2>/dev/null || true
+        die "could not mount ext4 storage"
+    }
+    mkdir -p "$DOCKER_DATA" "$ROOTFS"
+    chmod 700 "$DOCKER_DATA" "$ROOTFS"
+    log "mounted $IMAGE_FILE on $SERVER_MOUNT via $loopdev"
+}
+
+unmount_storage()
+{
+    pid_is_running "$DOCKER_PIDFILE" && die "stop Docker before unmounting storage"
+    pid_is_running "$LINUX_PIDFILE" && die "stop Linux before unmounting storage"
+    if storage_is_mounted; then
+        umount "$SERVER_MOUNT" || die "could not unmount $SERVER_MOUNT"
+    fi
+    loopdev=
+    [ -r "$LOOP_FILE" ] && loopdev=$(cat "$LOOP_FILE")
+    if [ -n "$loopdev" ]; then
+        losetup_bin=$(find_cmd auto losetup /data/data/com.termux/files/usr/bin/losetup) || true
+        [ -n "$losetup_bin" ] && "$losetup_bin" -d "$loopdev" 2>/dev/null || true
+    fi
+    rm -f "$LOOP_FILE"
+    log "storage unmounted"
+}
+
+cgroup_mount_for()
+{
+    controller=$1
+    awk -v controller="$controller" '
+        $3 == "cgroup" {
+            n=split($4, option, ",")
+            for (i=1; i<=n; i++) {
+                if (option[i] == controller) { print $2; exit }
+            }
+        }
+    ' /proc/mounts
+}
+
+named_cgroup_mount()
+{
+    hierarchy=$1
+    awk -v named="name=$hierarchy" '
+        $3 == "cgroup" {
+            n=split($4, option, ",")
+            for (i=1; i<=n; i++) {
+                if (option[i] == named) { print $2; exit }
+            }
+        }
+    ' /proc/mounts
+}
+
+cgroup_options_for_mount()
+{
+    source_mount=$1
+    awk -v source_mount="$source_mount" '$2 == source_mount && $3 == "cgroup" { print $4; exit }' /proc/mounts
+}
+
+cgroup_name_from_options()
+{
+    options=,$1,
+    name=
+    for controller in cpuset cpu cpuacct memory devices freezer blkio pids; do
+        case "$options" in
+            *,"$controller",*)
+                if [ -n "$name" ]; then name="$name,$controller"; else name=$controller; fi
+                ;;
+        esac
+    done
+    echo "$name"
+}
+
+cgroup_enabled()
+{
+    controller=$1
+    awk -v controller="$controller" '$1 == controller && $4 == 1 { found=1 } END { exit !found }' /proc/cgroups
+}
+
+mount_cgroups()
+{
+    ensure_dirs
+    mkdir -p "$CGROUP_ROOT"
+    if ! is_mounted "$CGROUP_ROOT"; then
+        mount -t tmpfs -o mode=755,nosuid,nodev,noexec cgroup_root "$CGROUP_ROOT" || die "could not mount cgroup root tmpfs"
+    fi
+
+    processed=" "
+    for controller in cpuset cpu cpuacct memory devices freezer blkio pids; do
+        cgroup_enabled "$controller" || continue
+        source_mount=$(cgroup_mount_for "$controller")
+        if [ -n "$source_mount" ]; then
+            case "$processed" in *" $source_mount "*) continue ;; esac
+            options=$(cgroup_options_for_mount "$source_mount")
+            group_name=$(cgroup_name_from_options "$options")
+            [ -n "$group_name" ] || group_name=$controller
+            destination="$CGROUP_ROOT/$group_name"
+            mkdir -p "$destination"
+            is_mounted "$destination" || mount --bind "$source_mount" "$destination" || die "could not bind $source_mount"
+            processed="$processed$source_mount "
+        else
+            destination="$CGROUP_ROOT/$controller"
+            mkdir -p "$destination"
+            mount -t cgroup -o "$controller" "$controller" "$destination" || die "could not mount cgroup controller $controller"
+        fi
+    done
+
+    # A named, controller-free hierarchy is required by systemd in cgroup v1
+    # mode. It does not take any controller away from Android.
+    source_mount=$(named_cgroup_mount systemd)
+    destination="$CGROUP_ROOT/systemd"
+    mkdir -p "$destination"
+    if [ -n "$source_mount" ]; then
+        is_mounted "$destination" || mount --bind "$source_mount" "$destination" || die "could not bind name=systemd hierarchy"
+    else
+        is_mounted "$destination" || mount -t cgroup -o none,name=systemd systemd "$destination" || die "could not mount name=systemd hierarchy"
+    fi
+}
+
+unmount_cgroups()
+{
+    pid_is_running "$DOCKER_PIDFILE" && die "stop Docker before unmounting cgroups"
+    pid_is_running "$LINUX_PIDFILE" && die "stop Linux before unmounting cgroups"
+    awk -v root="$CGROUP_ROOT/" 'index($2, root) == 1 { print $2 }' /proc/mounts | sort -r | while IFS= read -r target; do
+        umount "$target" 2>/dev/null || true
+    done
+    is_mounted "$CGROUP_ROOT" && umount "$CGROUP_ROOT" 2>/dev/null || true
+}
+
+show_cgroups()
+{
+    printf '%-12s %-7s %s\n' CONTROLLER READY MOUNT
+    for controller in cpuset cpu cpuacct memory devices freezer blkio pids; do
+        if ! cgroup_enabled "$controller"; then
+            printf '%-12s %-7s %s\n' "$controller" no disabled
+            continue
+        fi
+        source_mount=$(cgroup_mount_for "$controller")
+        if [ -n "$source_mount" ]; then
+            printf '%-12s %-7s %s\n' "$controller" yes "$source_mount"
+        else
+            printf '%-12s %-7s %s\n' "$controller" no unmounted
+        fi
+    done
+    source_mount=$(named_cgroup_mount systemd)
+    if [ -n "$source_mount" ]; then
+        printf '%-12s %-7s %s\n' systemd yes "$source_mount"
+    else
+        printf '%-12s %-7s %s\n' systemd no unmounted
+    fi
+}
+
+write_docker_config()
+{
+    runc=$(find_cmd "$RUNC_BIN" runc-upstream runc /data/local/tmp/runc.arm64) || die "runc not found; set RUNC_BIN in $CONFIG_FILE"
+    mkdir -p "$DOCKER_DATA" "$RUN_DIR/docker"
+    cat > "$DOCKER_CONFIG" <<EOF
+{
+  "data-root": "$DOCKER_DATA",
+  "storage-driver": "overlay2",
+  "exec-root": "$RUN_DIR/docker",
+  "pidfile": "$DOCKER_PIDFILE",
+  "default-runtime": "runc-upstream",
+  "runtimes": {
+    "runc-upstream": { "path": "$runc" }
+  },
+  "exec-opts": ["native.cgroupdriver=cgroupfs"],
+  "selinux-enabled": false,
+  "bridge": "none",
+  "iptables": false,
+  "ip6tables": false,
+  "ip-forward": false,
+  "ip-masq": false,
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "2" }
+}
+EOF
+}
+
+docker_start()
+{
+    pid_is_running "$DOCKER_PIDFILE" && return 0
+    rm -f "$DOCKER_STOP_FILE"
+    storage_is_mounted || mount_storage
+    mount_cgroups
+    grep -qw overlay /proc/filesystems || die "kernel does not expose OverlayFS"
+    dockerd=$(find_cmd "$DOCKERD_BIN" dockerd /data/data/com.termux/files/usr/bin/dockerd) || die "dockerd not found; set DOCKERD_BIN in $CONFIG_FILE"
+    write_docker_config
+    rm -f "$DOCKER_PIDFILE"
+    acquire_wakelock
+    log "starting Docker with overlay2 on ext4"
+    "$dockerd" --config-file "$DOCKER_CONFIG" >>"$LOG_DIR/dockerd.log" 2>&1 &
+    candidate_pid=$!
+    n=0
+    while [ "$n" -lt 20 ]; do
+        pid_is_running "$DOCKER_PIDFILE" && break
+        kill -0 "$candidate_pid" 2>/dev/null || break
+        sleep 1
+        n=$((n + 1))
+    done
+    if ! pid_is_running "$DOCKER_PIDFILE"; then
+        refresh_wakelock
+        die "dockerd failed to start; inspect $LOG_DIR/dockerd.log"
+    fi
+    log "Docker started"
+}
+
+docker_stop()
+{
+    touch "$DOCKER_STOP_FILE"
+    if pid_is_running "$DOCKER_PIDFILE"; then
+        pid=$(cat "$DOCKER_PIDFILE")
+        kill -TERM "$pid" 2>/dev/null || true
+        n=0
+        while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 20 ]; do
+            sleep 1
+            n=$((n + 1))
+        done
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$DOCKER_PIDFILE"
+    refresh_wakelock
+    log "Docker stopped"
+}
+
+rootfs_ready()
+{
+    [ -x "$ROOTFS/sbin/init" ]
+}
+
+prepare_rootfs()
+{
+    rootfs_ready || die "no system rootfs; run: serverctl import-rootfs /path/to/rootfs.tar.*"
+    mkdir -p "$ROOTFS/proc" "$ROOTFS/sys" "$ROOTFS/dev" "$ROOTFS/run" "$ROOTFS/tmp" "$ROOTFS/etc"
+    chmod 1777 "$ROOTFS/tmp"
+    echo "$LINUX_HOSTNAME" > "$ROOTFS/etc/hostname"
+    dns=$(getprop net.dns1 2>/dev/null)
+    [ -n "$dns" ] || dns=1.1.1.1
+    printf 'nameserver %s\n' "$dns" > "$ROOTFS/etc/resolv.conf"
+}
+
+import_rootfs()
+{
+    archive=$1
+    [ -n "$archive" ] || die "usage: serverctl import-rootfs /path/to/rootfs.tar.*"
+    [ -f "$archive" ] || die "$archive does not exist"
+    storage_is_mounted || mount_storage
+    if [ -n "$(ls -A "$ROOTFS" 2>/dev/null)" ]; then
+        die "$ROOTFS is not empty; refusing to overwrite it"
+    fi
+    tar_bin=$(find_cmd auto tar /data/data/com.termux/files/usr/bin/tar) || die "tar not found; run: pkg install tar"
+    log "importing rootfs; ownership and numeric IDs will be preserved"
+    "$tar_bin" --numeric-owner -xpf "$archive" -C "$ROOTFS" || die "rootfs extraction failed"
+    rootfs_ready || die "archive extracted but /sbin/init is missing or not executable"
+    prepare_rootfs
+    log "rootfs imported; set AUTO_START_LINUX=1 when it is configured"
+}
+
+linux_init()
+{
+    # Before replacing /proc, NSpid exposes both the Android host PID and PID 1
+    # in the new namespace. Store the host PID for nsenter and stop/status.
+    host_pid=$(awk '$1 == "NSpid:" { print $2; exit }' /proc/self/status)
+    [ -n "$host_pid" ] || host_pid=$$
+    echo "$host_pid" > "$LINUX_PIDFILE"
+    acquire_wakelock
+
+    mount --make-rprivate / || die "could not make Linux mount namespace private"
+    mount -t proc proc "$ROOTFS/proc" || die "could not mount proc"
+    mount --rbind /dev "$ROOTFS/dev" || die "could not bind /dev"
+    mount --rbind /sys "$ROOTFS/sys" || die "could not bind /sys"
+    mount -t tmpfs -o mode=755,nosuid,nodev tmpfs "$ROOTFS/run" || die "could not mount /run"
+    mkdir -p "$ROOTFS/sys/fs/cgroup"
+    if is_mounted "$CGROUP_ROOT"; then
+        mount --rbind "$CGROUP_ROOT" "$ROOTFS/sys/fs/cgroup" || die "could not bind cgroup v1 hierarchy"
+    fi
+    hostname "$LINUX_HOSTNAME" 2>/dev/null || true
+    chroot_bin=$(find_cmd auto chroot /system/bin/chroot /data/data/com.termux/files/usr/bin/chroot) || die "chroot not found"
+    container=hi3660
+    HOME=/root
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    export container HOME PATH
+    # exec is required: systemd must remain PID 1 inside the new namespace.
+    exec "$chroot_bin" "$ROOTFS" /sbin/init
+}
+
+linux_start()
+{
+    pid_is_running "$LINUX_PIDFILE" && return 0
+    rm -f "$LINUX_STOP_FILE"
+    storage_is_mounted || mount_storage
+    mount_cgroups
+    prepare_rootfs
+    unshare_bin=$(find_cmd "$UNSHARE_BIN" unshare /data/data/com.termux/files/usr/bin/unshare) || die "unshare not found; run: pkg install util-linux"
+    rm -f "$LINUX_PIDFILE"
+    acquire_wakelock
+    log "starting Linux system container with host networking"
+    "$unshare_bin" -f -p -m -u -i -- "$0" _linux-init >>"$LOG_DIR/linux.log" 2>&1 &
+    launcher_pid=$!
+    n=0
+    while [ "$n" -lt 20 ]; do
+        pid_is_running "$LINUX_PIDFILE" && break
+        kill -0 "$launcher_pid" 2>/dev/null || break
+        sleep 1
+        n=$((n + 1))
+    done
+    if ! pid_is_running "$LINUX_PIDFILE"; then
+        refresh_wakelock
+        die "Linux init failed to start; inspect $LOG_DIR/linux.log"
+    fi
+    log "Linux system container started"
+}
+
+linux_stop()
+{
+    touch "$LINUX_STOP_FILE"
+    if pid_is_running "$LINUX_PIDFILE"; then
+        pid=$(cat "$LINUX_PIDFILE")
+        nsenter_bin=$(find_cmd "$NSENTER_BIN" nsenter /data/data/com.termux/files/usr/bin/nsenter) || true
+        if [ -n "$nsenter_bin" ] && [ -x "$ROOTFS/bin/systemctl" ]; then
+            "$nsenter_bin" -t "$pid" -m -u -i -p -- chroot "$ROOTFS" /bin/systemctl poweroff >/dev/null 2>&1 || true
+        fi
+        n=0
+        while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 20 ]; do
+            sleep 1
+            n=$((n + 1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 2
+        fi
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$LINUX_PIDFILE"
+    refresh_wakelock
+    log "Linux system container stopped"
+}
+
+start_monitor()
+{
+    pid_is_running "$MONITOR_PIDFILE" && return 0
+    "$0" monitor >>"$LOG_DIR/monitor.log" 2>&1 &
+    echo $! > "$MONITOR_PIDFILE"
+}
+
+monitor_loop()
+{
+    echo $$ > "$MONITOR_PIDFILE"
+    trap 'rm -f "$MONITOR_PIDFILE"; exit 0' TERM INT EXIT
+    while :; do
+        if [ "$AUTO_START_DOCKER" = 1 ] && [ "$AUTO_RESTART_DOCKER" = 1 ] && [ ! -e "$DOCKER_STOP_FILE" ] && storage_is_mounted && ! pid_is_running "$DOCKER_PIDFILE"; then
+            docker_start || true
+        fi
+        if [ "$AUTO_START_LINUX" = 1 ] && [ "$AUTO_RESTART_LINUX" = 1 ] && [ ! -e "$LINUX_STOP_FILE" ] && storage_is_mounted && rootfs_ready && ! pid_is_running "$LINUX_PIDFILE"; then
+            linux_start || true
+        fi
+        refresh_wakelock
+        sleep "$MONITOR_INTERVAL"
+    done
+}
+
+boot_services()
+{
+    ensure_dirs
+    wait_for_android
+    # Manual stops last until the next explicit boot/reboot, not forever.
+    rm -f "$DOCKER_STOP_FILE" "$LINUX_STOP_FILE"
+    if [ "$AUTO_MOUNT_STORAGE" = 1 ] && [ -f "$IMAGE_FILE" ]; then
+        mount_storage || exit 1
+    fi
+    if storage_is_mounted; then
+        mount_cgroups || exit 1
+        [ "$AUTO_START_DOCKER" = 1 ] && docker_start || true
+        if [ "$AUTO_START_LINUX" = 1 ] && rootfs_ready; then
+            linux_start || true
+        fi
+    fi
+    start_monitor
+    refresh_wakelock
+}
+
+shutdown_services()
+{
+    if pid_is_running "$MONITOR_PIDFILE"; then
+        kill -TERM "$(cat "$MONITOR_PIDFILE")" 2>/dev/null || true
+    fi
+    rm -f "$MONITOR_PIDFILE"
+    linux_stop
+    docker_stop
+    unmount_cgroups
+    storage_is_mounted && unmount_storage || true
+    refresh_wakelock
+}
+
+show_status()
+{
+    if storage_is_mounted; then storage=mounted; elif [ -f "$IMAGE_FILE" ]; then storage=unmounted; else storage=not-initialized; fi
+    if pid_is_running "$DOCKER_PIDFILE"; then docker=running; else docker=stopped; fi
+    if pid_is_running "$LINUX_PIDFILE"; then linux=running; else linux=stopped; fi
+    if pid_is_running "$MONITOR_PIDFILE"; then monitor=running; else monitor=stopped; fi
+    if [ -r /sys/power/wake_lock ] && grep -qw "$WAKELOCK_NAME" /sys/power/wake_lock 2>/dev/null; then wake=held; else wake=released; fi
+    enforcing=$(getenforce 2>/dev/null || echo unknown)
+    echo "storage=$storage ($IMAGE_FILE -> $SERVER_MOUNT)"
+    echo "docker=$docker"
+    echo "linux=$linux"
+    echo "monitor=$monitor"
+    echo "wake_lock=$wake"
+    echo "selinux=$enforcing"
+}
+
+validate_runtime()
+{
+    failures=0
+    grep -qw overlay /proc/filesystems && log "OK OverlayFS" || { log "FAIL OverlayFS"; failures=$((failures + 1)); }
+    [ -e /dev/loop-control ] || [ -e /dev/block/loop-control ] && log "OK loop control" || { log "FAIL loop control"; failures=$((failures + 1)); }
+    [ -w /sys/power/wake_lock ] && log "OK dynamic wake lock" || { log "FAIL wake lock sysfs"; failures=$((failures + 1)); }
+    storage_is_mounted && log "OK ext4 server storage mounted" || log "INFO storage is not mounted"
+    show_cgroups
+    memory_mount=$(cgroup_mount_for memory)
+    if cgroup_enabled memory && [ -n "$memory_mount" ] && [ -e "$memory_mount/memory.limit_in_bytes" ]; then
+        log "OK memory.limit_in_bytes"
+    else
+        log "FAIL memory controller limit file"
+        failures=$((failures + 1))
+    fi
+    cpu_mount=$(cgroup_mount_for cpu)
+    if cgroup_enabled cpu && [ -n "$cpu_mount" ] && [ -e "$cpu_mount/cpu.cfs_period_us" ] && [ -e "$cpu_mount/cpu.cfs_quota_us" ]; then
+        log "OK CPU CFS bandwidth files"
+    else
+        log "FAIL CPU CFS bandwidth files"
+        failures=$((failures + 1))
+    fi
+    cpuset_mount=$(cgroup_mount_for cpuset)
+    [ -n "$cpuset_mount" ] && [ -e "$cpuset_mount/cpuset.cpus" ] && [ -e "$cpuset_mount/cpuset.mems" ] && log "OK cpuset files" || log "INFO cpuset files unavailable"
+    devices_mount=$(cgroup_mount_for devices)
+    [ -n "$devices_mount" ] && [ -e "$devices_mount/devices.allow" ] && log "OK devices.allow" || log "INFO devices controller unavailable"
+    pids_mount=$(cgroup_mount_for pids)
+    [ -n "$pids_mount" ] && [ -e "$pids_mount/pids.max" ] && log "OK pids.max" || log "INFO pids controller unavailable"
+    for tool in mke2fs e2fsck losetup unshare nsenter tar; do
+        find_cmd auto "$tool" "/data/data/com.termux/files/usr/bin/$tool" >/dev/null && log "OK $tool" || log "INFO missing $tool"
+    done
+    if pid_is_running "$DOCKER_PIDFILE"; then
+        docker_bin=$(find_cmd "$DOCKER_BIN" docker /data/data/com.termux/files/usr/bin/docker) || true
+        [ -n "$docker_bin" ] && "$docker_bin" info --format 'Docker storage={{.Driver}} cgroup={{.CgroupDriver}}' 2>/dev/null || true
+    fi
+    [ "$failures" -eq 0 ]
+}
+
+show_logs()
+{
+    lines=${1:-100}
+    for logfile in "$LOG_DIR/service.log" "$LOG_DIR/dockerd.log" "$LOG_DIR/linux.log" "$LOG_DIR/monitor.log"; do
+        [ -f "$logfile" ] || continue
+        echo "===== $logfile ====="
+        tail -n "$lines" "$logfile"
+    done
+}
+
+usage()
+{
+    cat <<EOF
+Usage: serverctl COMMAND [ARG]
+
+  status                         show runtime state
+  validate                       validate kernel and userspace prerequisites
+  init-storage [MiB]             explicitly create the ext4 loop image
+  mount-storage | unmount-storage
+  cgroup-mount | cgroup-unmount | cgroup-status
+  docker-start | docker-stop
+  import-rootfs ARCHIVE          import Debian/Ubuntu rootfs tar archive
+  linux-start | linux-stop
+  boot | shutdown                start or stop configured services
+  logs [LINES]                   show service logs
+
+Persistent configuration: $CONFIG_FILE
+EOF
+}
+
+ensure_dirs
+case "${1:-}" in
+    status) show_status ;;
+    validate) validate_runtime ;;
+    init-storage) init_storage "${2:-}" ;;
+    mount-storage) mount_storage ;;
+    unmount-storage) unmount_storage ;;
+    cgroup-mount) mount_cgroups ;;
+    cgroup-unmount) unmount_cgroups ;;
+    cgroup-status) show_cgroups ;;
+    docker-start) docker_start ;;
+    docker-stop) docker_stop ;;
+    import-rootfs) import_rootfs "${2:-}" ;;
+    linux-start) linux_start ;;
+    linux-stop) linux_stop ;;
+    boot) boot_services ;;
+    shutdown) shutdown_services ;;
+    monitor) monitor_loop ;;
+    logs) show_logs "${2:-}" ;;
+    _linux-init) linux_init ;;
+    -h|--help|help|'') usage ;;
+    *) usage >&2; exit 2 ;;
+esac

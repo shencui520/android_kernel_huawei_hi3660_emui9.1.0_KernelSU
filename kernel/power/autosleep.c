@@ -98,15 +98,6 @@ int pm_autosleep_set_state(suspend_state_t state)
 
 	mutex_lock(&autosleep_lock);
 
-	/*
-	 * Keep Android's display timeout as a display-only action.  The
-	 * framework may still request suspend-to-RAM through autosleep, but
-	 * containers and network services must remain runnable after the
-	 * screen has turned off.
-	 */
-	if (state > PM_SUSPEND_ON)
-		state = PM_SUSPEND_ON;
-
 	autosleep_state = state;
 
 	__pm_relax(autosleep_ws);
